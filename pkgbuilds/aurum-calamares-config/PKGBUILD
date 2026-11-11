@@ -1,0 +1,14 @@
+# Maintainer: aurumOS
+pkgname=aurum-calamares-config
+pkgver=1.0.0
+pkgrel=1
+pkgdesc='Calamares installer configuration and branding for aurumOS'
+arch=('any')
+url='https://calamares.io/'
+license=('CC0-1.0' 'GPL-3.0-or-later')
+depends=('calamares')
+
+package() {
+  install -d "$pkgdir/etc/calamares"
+  cp -a "$startdir/etc/calamares/." "$pkgdir/etc/calamares/"
+}

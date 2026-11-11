@@ -1,0 +1,4 @@
+# AUR package bases to include. PKGBUILDs are cloned from AUR at build time.
+paru
+downgrade
+pacseek

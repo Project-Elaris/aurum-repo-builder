@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+workspace=${WORKSPACE:-/workspace}
+repository=${REPOSITORY:-/repository}
+arch=${CARCH:-x86_64}
+build_root=$(mktemp -d "${TMPDIR:-/tmp}/aurum-build.XXXXXX")
+repo_dir="$repository/$arch"
+
+cleanup() {
+  rm -rf -- "$build_root"
+}
+trap cleanup EXIT
+
+fail() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+copy_package_tree() {
+  local source_dir=$1
+  local destination_dir=$2
+
+  mkdir -p "$destination_dir"
+  tar --exclude='.git' --exclude='*/.git' -C "$source_dir" -cf - . \
+    | tar -C "$destination_dir" -xf -
+}
+
+build_package() {
+  local source_dir=$1
+  local build_dir=$2
+  local artifact
+  local found=0
+
+  copy_package_tree "$source_dir" "$build_dir"
+
+  (
+    cd "$build_dir"
+    makepkg --syncdeps --noconfirm --cleanbuild --clean --force
+  )
+
+  while IFS= read -r -d '' artifact; do
+    install -m 0644 "$artifact" "$repo_dir/$(basename "$artifact")"
+    found=1
+  done < <(find "$build_dir" -maxdepth 1 -type f -name '*.pkg.tar.zst' -print0)
+
+  (( found )) || fail "no package archives produced from $source_dir"
+}
+
+[[ -d "$workspace/pkgbuilds" ]] || fail "missing pkgbuilds directory: $workspace/pkgbuilds"
+[[ -f "$workspace/pkgbuilds/aur-packages.txt" ]] || fail "missing AUR package list"
+
+mkdir -p "$repo_dir"
+find "$repo_dir" -maxdepth 1 \( \
+  -name '*.pkg.tar.zst' -o \
+  -name 'aurum.db*' -o \
+  -name 'aurum.files*' \
+\) -delete
+
+mapfile -t local_pkgbuilds < <(find "$workspace/pkgbuilds" -mindepth 2 -maxdepth 2 -type f -name PKGBUILD | sort)
+(( ${#local_pkgbuilds[@]} > 0 )) || fail "no local PKGBUILDs found"
+
+# Build and install the locally maintained Calamares package first so the
+# config package can resolve its dependency even when Calamares is absent from
+# Arch's current binary repositories.
+calamares_dir="$workspace/pkgbuilds/calamares"
+if [[ -f "$calamares_dir/PKGBUILD" ]]; then
+  printf '\n==> Building local package: calamares\n'
+  build_package "$calamares_dir" "$build_root/calamares"
+  shopt -s nullglob
+  calamares_archives=("$repo_dir"/calamares-*.pkg.tar.zst)
+  (( ${#calamares_archives[@]} > 0 )) || fail "local Calamares package archive was not created"
+  sudo pacman -U --noconfirm "${calamares_archives[@]}"
+fi
+
+for pkgbuild in "${local_pkgbuilds[@]}"; do
+  package_dir=${pkgbuild%/PKGBUILD}
+  package_name=${package_dir##*/}
+  if [[ "$package_name" == calamares ]]; then
+    continue
+  fi
+  printf '\n==> Building local package: %s\n' "$package_name"
+  build_package "$package_dir" "$build_root/$package_name"
+done
+
+while IFS= read -r package_name || [[ -n "$package_name" ]]; do
+  if [[ -z "$package_name" || "$package_name" == \#* ]]; then
+    continue
+  fi
+  [[ "$package_name" =~ ^[a-z0-9@._+-]+$ ]] || fail "invalid AUR package name: $package_name"
+
+  source_dir="$build_root/aur-$package_name"
+  printf '\n==> Fetching AUR package: %s\n' "$package_name"
+  git clone --depth=1 "https://aur.archlinux.org/${package_name}.git" "$source_dir"
+  printf '\n==> Building AUR package: %s\n' "$package_name"
+  build_package "$source_dir" "$build_root/build-$package_name"
+done < "$workspace/pkgbuilds/aur-packages.txt"
+
+shopt -s nullglob
+archives=("$repo_dir"/*.pkg.tar.zst)
+(( ${#archives[@]} > 0 )) || fail "repository has no package archives"
+
+repo-add "$repo_dir/aurum.db.tar.gz" "${archives[@]}"
+printf '\n==> Repository created at %s\n' "$repo_dir"

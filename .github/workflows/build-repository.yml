@@ -1,0 +1,65 @@
+name: Build Arch package repository
+
+on:
+  push:
+    branches: [main, master]
+  schedule:
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: aurum-package-repository
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build Arch package builder image
+        run: >-
+          docker build --pull
+          --build-arg BUILDER_UID="$(id -u)"
+          --build-arg BUILDER_GID="$(id -g)"
+          --tag aurum-repo-builder .
+
+      - name: Prepare package inputs
+        run: |
+          mkdir -p "$RUNNER_TEMP/aurum-input/pkgbuilds"
+          rsync -a --exclude='.git' \
+            "$GITHUB_WORKSPACE/pkgbuilds/" \
+            "$RUNNER_TEMP/aurum-input/pkgbuilds/"
+
+      - name: Build packages and repository database
+        run: |
+          mkdir -p "$RUNNER_TEMP/aurum-repository"
+          docker run --rm \
+            --volume "$RUNNER_TEMP/aurum-input:/workspace:ro" \
+            --volume "$RUNNER_TEMP/aurum-repository:/repository" \
+            aurum-repo-builder
+
+      - name: Publish repository to the repo branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          deploy_dir="$RUNNER_TEMP/aurum-repo-branch"
+          mkdir -p "$deploy_dir"
+          rsync -aL --delete "$RUNNER_TEMP/aurum-repository/" "$deploy_dir/"
+
+          git -C "$deploy_dir" init --initial-branch=repo
+          git -C "$deploy_dir" config user.name 'github-actions[bot]'
+          git -C "$deploy_dir" config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C "$deploy_dir" add --all
+          git -C "$deploy_dir" commit --message 'Publish Arch package repository'
+          git -C "$deploy_dir" remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+
+          auth_header="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 --wrap=0)"
+          git -C "$deploy_dir" \
+            -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth_header" \
+            push --force origin repo
